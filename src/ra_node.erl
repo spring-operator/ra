@@ -31,6 +31,8 @@
         fun((ra_index(), Command :: ra_machine_command(), term()) -> ra_machine_apply_fun_return()) |
         fun((term(), term()) -> ra_machine_apply_fun_return()).
 
+-type sync_strategy() :: always | except_usr | periodic.
+
 -type ra_node_state() ::
     #{id => ra_node_id(),
       leader_id => maybe(ra_node_id()),
@@ -53,7 +55,7 @@
       initial_machine_state => term(),
       snapshot_index_term => ra_idxterm(),
       snapshot_points => #{ra_index() => {ra_term(), ra_cluster()}},
-      sync_strategy => always | except_usr
+      sync_strategy =>  sync_strategy()
       }.
 
 -type ra_state() :: leader | follower | candidate.
@@ -82,7 +84,7 @@
                             initial_nodes => [ra_node_id()],
                             apply_fun => ra_machine_apply_fun(),
                             init_fun => fun((atom()) -> term()),
-                            sync_strategy => always | except_usr,
+                            sync_strategy => sync_strategy(),
                             cluster_id => atom()}.
 
 -export_type([ra_node_state/0,
@@ -255,10 +257,10 @@ handle_leader({command, Cmd}, State00 = #{id := Id}) ->
                         % ask ra_node_proc to schedule a sync depending on
                         % sync_strategy
                         case State0 of
-                            #{sync_strategy := always} ->
-                                {State0, [schedule_sync], 0};
                             #{sync_strategy := except_usr} ->
-                                evaluate_quorum(update_match_index(Id, Idx, State0))
+                                evaluate_quorum(update_match_index(Id, Idx, State0));
+                            #{sync_strategy := _} -> % periodic or always
+                                {State0, [schedule_sync], 0}
                         end
                 end,
             % Only "pipeline" in response to a command
@@ -417,7 +419,7 @@ handle_follower(#append_entries_rpc{term = Term,
             State1 = lists:foldl(fun append_log_follower/2,
                                  State0, Entries),
             % only sync if we have received entries
-            ok = maybe_sync_log(Entries, State1),
+            {ok, SyncEffects} = maybe_sync_log(Entries, State1),
 
             % ?DBG("~p: follower received ~p append_entries in ~p.",
             %      [Id, {PLIdx, PLTerm, length(Entries)}, Term]),
@@ -436,7 +438,8 @@ handle_follower(#append_entries_rpc{term = Term,
                                    end, Effects0),
             Reply = append_entries_reply(Term, true, State),
             {follower, State, [{reply, Reply},
-                               {incr_metrics, ra_metrics, [{3, Applied}]} | Effects]};
+                               {incr_metrics, ra_metrics, [{3, Applied}]}
+                               | Effects ++ SyncEffects]};
         false ->
             ?DBG("~p: follower did not have entry at ~b in ~b~n",
                  [Id, PLIdx, PLTerm]),
@@ -866,12 +869,14 @@ append_log_follower(Entry, State = #{log := Log0}) ->
     State#{log => Log}.
 
 maybe_sync_log([], _State) ->
-    ok;
+    {ok, []};
 maybe_sync_log(_Entries, #{sync_strategy := except_usr}) ->
-    ok;
+    {ok, []};
+maybe_sync_log(_Entries, #{sync_strategy := periodic}) ->
+    {ok, [schedule_sync]};
 maybe_sync_log(_Entries, #{log := Log0, sync_strategy := always}) ->
     ok = ra_log:sync(Log0),
-    ok.
+    {ok, []}.
 
 append_cluster_change(Cluster, From, ReplyMode,
                       State = #{log := Log0,

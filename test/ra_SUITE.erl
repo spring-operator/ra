@@ -7,7 +7,9 @@
 all() ->
     [
      {group, ra_log_memory},
-     {group, ra_log_file}
+     {group, ra_log_file},
+     {group, ra_log_file_sync_always},
+     {group, ra_log_file_sync_periodic}
     ].
 
 all_tests() ->
@@ -34,7 +36,8 @@ groups() ->
     [
      {ra_log_memory, [], all_tests()},
      {ra_log_file, [], all_tests()},
-     {ra_log_file_sync_always, [], all_tests()}
+     {ra_log_file_sync_always, [], all_tests()},
+     {ra_log_file_sync_periodic, [], all_tests()}
     ].
 
 suite() -> [{timetrap, {seconds, 30}}].
@@ -61,15 +64,19 @@ init_per_group(ra_log_memory, Config) ->
           end,
    [{start_node_fun, Fun} | Config];
 init_per_group(Group, Config)
-  when Group == ra_log_file orelse Group == ra_log_file_sync_always ->
+  when Group == ra_log_file orelse
+       Group == ra_log_file_sync_always orelse
+       Group == ra_log_file_sync_periodic ->
     PrivDir = ?config(priv_dir, Config),
     SyncStrategy = case Group of
                        ra_log_file -> except_usr;
+                       ra_log_file_sync_periodic -> periodic;
                        _ -> always
                    end,
     Fun = fun (TestCase) ->
                   fun (Name, Nodes, ApplyFun, InitialState) ->
-                          Dir = filename:join([PrivDir, TestCase, ra_lib:to_list(Name)]),
+                          Dir = filename:join([PrivDir, atom_to_list(Group),
+                                               TestCase, ra_lib:to_list(Name)]),
                           ok = filelib:ensure_dir(Dir),
                           Conf = #{log_module => ra_log_file,
                                    log_init_args => #{directory => Dir},
