@@ -36,6 +36,24 @@
 %% <code>-callback overview(state()) -> map(). </code>
 %%
 %% Optional. A map of overview information. Needs to be efficient.
+%%
+%%
+%%<br></br>
+%% <code>
+%% -callback version() -> version().
+%% </code>
+%%
+%% Optional: Returns the latest machine version. If not implemented this is
+%% defaulted to 0.
+%%<br></br>
+%%
+%% <code>
+%% -callback which_module(version()) -> module().
+%% </code>
+%%
+%% Optional: implements a lookup from version to the module implementing the
+%% machine logic for that version.
+
 
 -module(ra_machine).
 
@@ -53,7 +71,9 @@
          module/1,
          init_aux/2,
          handle_aux/7,
-         snapshot_module/1
+         snapshot_module/1,
+         version/1,
+         which_module/2
         ]).
 
 -type state() :: term().
@@ -86,6 +106,8 @@
 -type send_msg_opts() :: send_msg_opt() | [send_msg_opt()].
 -type locator() :: pid() | atom() | {atom(), node()}.
 
+-type version() :: non_neg_integer().
+
 -type effect() ::
     {send_msg, To :: locator(), Msg :: term()} |
     {send_msg, To :: locator(), Msg :: term(), Options :: send_msg_opts()} |
@@ -97,8 +119,12 @@
     {timer, non_neg_integer() | infinity} |
     {log, ra_index(), fun((term()) -> maybe(effect()))} |
     {release_cursor, ra_index(), state()} |
+    %% overloaded effect that includes the machine version to capture
+    %% in the snapshot if the snapshot is for a non-current index
+    {release_cursor, ra_index(), state(), version()} |
     {aux, term()} |
     garbage_collection.
+
 %% Effects are data structure that can be returned by {@link apply/3} to ask
 %% ra to realise a side-effect in the real works, such as sending
 %% a message to a process.
@@ -150,6 +176,7 @@
 
 
 -export_type([machine/0,
+              version/0,
               effect/0,
               effects/0,
               reply/0,
@@ -161,7 +188,9 @@
                      init_aux/1,
                      handle_aux/6,
                      overview/1,
-                     snapshot_module/0
+                     snapshot_module/0,
+                     version/0,
+                     which_module/1
                      ]).
 
 -define(OPT_CALL(Call, Def),
@@ -172,10 +201,14 @@
             Def
     end).
 
+-define(DEFAULT_VERSION, 0).
+
 -callback init(Conf :: machine_init_args()) -> state().
 
 -callback 'apply'(command_meta_data(), command(), State) ->
     {State, reply(), effects()} | {State, reply()} when State :: term().
+
+%% Optional callbacks
 
 -callback state_enter(ra_server:ra_state() | eol, state()) -> effects().
 
@@ -198,35 +231,51 @@
 
 -callback snapshot_module() -> module().
 
+-callback version() -> version().
+
+-callback which_module(version()) -> module().
+
 %% @doc initialise a new machine
+%% This is only called on startup only if there isn't yet a snapshot to recover
+%% from. Once a snapshot has been taking this is never called again.
 -spec init(machine(), atom()) -> state().
 init({machine, Mod, Args}, Name) ->
     Mod:init(Args#{name => Name}).
 
--spec apply(machine(), command_meta_data(), command(), State) ->
+-spec apply(module(), command_meta_data(), command(), State) ->
     {State, reply(), effects()} | {State, reply()}.
-apply({machine, Mod, _}, Metadata, Cmd, State) ->
+apply(Mod, Metadata, Cmd, State) ->
     Mod:apply(Metadata, Cmd, State).
 
--spec tick(machine(), milliseconds(), state()) -> effects().
-tick({machine, Mod, _}, TimeMs, State) ->
+-spec tick(module(), milliseconds(), state()) -> effects().
+tick(Mod, TimeMs, State) ->
     ?OPT_CALL(Mod:tick(TimeMs, State), []).
 
 %% @doc called when the ra_server_proc enters a new state
--spec state_enter(machine(), ra_server:ra_state() | eol, state()) ->
+-spec state_enter(module(), ra_server:ra_state() | eol, state()) ->
     effects().
-state_enter({machine, Mod, _}, RaftState, State) ->
+state_enter(Mod, RaftState, State) ->
     ?OPT_CALL(Mod:state_enter(RaftState, State), []).
 
--spec overview(machine(), state()) -> map().
-overview({machine, Mod, _}, State) ->
+-spec overview(module(), state()) -> map().
+overview(Mod, State) ->
     ?OPT_CALL(Mod:overview(State), State).
 
--spec init_aux(machine(), atom()) -> term().
-init_aux({machine, Mod, _}, Name) ->
+%% @doc used to discover the latest machine version supported by the current
+%% code
+-spec version(machine()) -> version().
+version({machine, Mod, _}) ->
+    ?OPT_CALL(assert_integer(Mod:version()), ?DEFAULT_VERSION).
+
+-spec which_module(machine(), version()) -> module().
+which_module({machine, Mod, _}, Version) ->
+    ?OPT_CALL(Mod:which_module(Version), Mod).
+
+-spec init_aux(module(), atom()) -> term().
+init_aux(Mod, Name) ->
     ?OPT_CALL(Mod:init_aux(Name), undefined).
 
--spec handle_aux(machine(), ra_server:ra_state(),
+-spec handle_aux(module(), ra_server:ra_state(),
                  {call, From :: from()} | cast,
                  Command :: term(), AuxState,
                  LogState, MacState :: state()) ->
@@ -235,7 +284,7 @@ init_aux({machine, Mod, _}, Name) ->
     undefined
       when AuxState :: term(),
            LogState :: ra_log:ra_log().
-handle_aux({machine, Mod, _}, RaftState, Type, Cmd, Aux, Log, MacState) ->
+handle_aux(Mod, RaftState, Type, Cmd, Aux, Log, MacState) ->
     ?OPT_CALL(Mod:handle_aux(RaftState, Type, Cmd, Aux, Log, MacState),
               undefined).
 
@@ -260,3 +309,8 @@ module({machine, Mod, _}) -> Mod.
 -spec snapshot_module(machine()) -> module().
 snapshot_module({machine, Mod, _}) ->
     ?OPT_CALL(Mod:snapshot_module(), ?DEFAULT_SNAPSHOT_MODULE).
+
+%% internals
+
+assert_integer(I) when is_integer(I) andalso I > 0 ->
+    I.

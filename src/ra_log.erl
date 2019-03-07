@@ -22,7 +22,7 @@
          install_snapshot/3,
          recover_snapshot/1,
          snapshot_index_term/1,
-         update_release_cursor/4,
+         update_release_cursor/5,
 
          can_write/1,
          exists/2,
@@ -474,19 +474,20 @@ snapshot_index_term(#?MODULE{snapshot_state = SS}) ->
     ra_snapshot:current(SS).
 
 -spec update_release_cursor(Idx :: ra_index(), Cluster :: ra_cluster(),
-                            Ref :: term(), State :: ra_log()) ->
+                            MacVersion :: ra_machine:version(),
+                            MacState :: term(), State :: ra_log()) ->
     {ra_log(), effects()}.
-update_release_cursor(Idx, Cluster, MacState,
+update_release_cursor(Idx, Cluster, MacVersion, MacState,
                       #?MODULE{snapshot_state = SnapState} = State) ->
     case ra_snapshot:pending(SnapState) of
         undefined ->
-            update_release_cursor0(Idx, Cluster, MacState, State);
+            update_release_cursor0(Idx, Cluster, MacVersion, MacState, State);
         _ ->
             % if a snapshot is in progress don't even evaluate
             {State, []}
     end.
 
-update_release_cursor0(Idx, Cluster, MacState,
+update_release_cursor0(Idx, Cluster, MacVersion, MacState,
                        #?MODULE{segment_refs = SegRefs,
                                 snapshot_state = SnapState,
                                 snapshot_interval = SnapInter} = State0) ->
@@ -495,6 +496,9 @@ update_release_cursor0(Idx, Cluster, MacState,
                     undefined -> SnapInter;
                     {I, _} -> I + SnapInter
                 end,
+    Meta = #{index => Idx,
+             cluster => ClusterServerIds,
+             version => MacVersion},
     % The release cursor index is the last entry _not_ contributing
     % to the current state. I.e. the last entry that can be discarded.
     % Check here if any segments can be release.
@@ -518,8 +522,7 @@ update_release_cursor0(Idx, Cluster, MacState,
                 {undefined, _} ->
                     exit({term_not_found_for_index, Idx});
                 {Term, State} ->
-                    write_snapshot({Idx, Term, ClusterServerIds},
-                                   MacState, State)
+                    write_snapshot(Meta#{term => Term}, MacState, State)
             end;
         false when Idx > SnapLimit ->
             %% periodically take snapshots event if segments cannot be cleared
@@ -528,8 +531,7 @@ update_release_cursor0(Idx, Cluster, MacState,
                 {undefined, State} ->
                     {State, []};
                 {Term, State} ->
-                    write_snapshot({Idx, Term, ClusterServerIds},
-                                   MacState, State)
+                    write_snapshot(Meta#{term => Term}, MacState, State)
             end;
         false ->
             {State0, []}

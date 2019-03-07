@@ -61,6 +61,8 @@
       stop_after => ra_index(),
       machine := ra_machine:machine(),
       machine_state := term(),
+      machine_version := ra_machine:version(),
+      effective_machine_version := ra_machine:version(),
       aux_state => term(),
       condition => ra_await_condition_fun(),
       condition_timeout_effects => [ra_effect()],
@@ -87,7 +89,8 @@
                               noreply.
 
 -type command() :: {command_type(), command_meta(),
-                    UserCommand :: term(), command_reply_mode()} | noop.
+                    UserCommand :: term(), command_reply_mode()} |
+                   {noop, CurrentMachineVersion :: ra_machine:version()}.
 
 -type ra_msg() :: #append_entries_rpc{} |
                   {ra_server_id(), #append_entries_reply{}} |
@@ -196,6 +199,7 @@ init(#{id := Id,
                   {module, Mod, Args} ->
                       {machine, Mod, Args}
               end,
+
     SnapModule = ra_machine:snapshot_module(Machine),
 
     Log0 = ra_log:init(LogInitArgs#{snapshot_module => SnapModule,
@@ -206,16 +210,21 @@ init(#{id := Id,
     LastApplied = ra_log_meta:fetch(UId, last_applied, 0),
     VotedFor = ra_log_meta:fetch(UId, voted_for, undefined),
 
-    {FirstIndex, Cluster0, MacState, SnapshotIndexTerm} =
+
+    {FirstIndex, Cluster0, MacVer, MacState, SnapshotIndexTerm} =
         case ra_log:recover_snapshot(Log0) of
             undefined ->
                 InitialMachineState = ra_machine:init(Machine, Name),
                 {0, make_cluster(Id, InitialNodes),
+                 undefined,
                  InitialMachineState, {0, 0}};
-            {{Idx, Term, ClusterNodes}, MacSt} ->
+            {#{index := Idx,
+               term := Term,
+               cluster := ClusterNodes,
+               version := MacVersion}, MacSt} ->
                 Clu = make_cluster(Id, ClusterNodes),
                 %% the snapshot is the last index before the first index
-                {Idx, Clu, MacSt, {Idx, Term}}
+                {Idx, Clu, MacVersion, MacSt, {Idx, Term}}
         end,
 
     CommitIndex = max(LastApplied, FirstIndex),
@@ -239,6 +248,7 @@ init(#{id := Id,
       log => Log0,
       machine => Machine,
       machine_state => MacState,
+      effective_machine_version => MacVer,
       aux_state => ra_machine:init_aux(Machine, Name),
       condition_timeout_effects => []}.
 
@@ -558,15 +568,17 @@ handle_leader(Msg, State) ->
 -spec handle_candidate(ra_msg() | election_timeout, ra_server_state()) ->
     {ra_state(), ra_server_state(), ra_effects()}.
 handle_candidate(#request_vote_result{term = Term, vote_granted = true},
-                 #{current_term := Term, votes := Votes,
+                 #{current_term := Term,
+                   votes := Votes,
+                   machine := Mac,
                    cluster := Nodes} = State0) ->
     NewVotes = Votes + 1,
     case trunc(maps:size(Nodes) / 2) + 1 of
         NewVotes ->
             {State, Effects} = make_all_rpcs(initialise_peers(State0)),
-            % Effects = ra_machine:leader_effects(Machine, MacState),
+            Noop = {noop, ra_machine:version(Mac)},
             {leader, maps:without([votes, leader_id], State),
-             [{next_event, cast, {command, noop}} | Effects]};
+             [{next_event, cast, {command, Noop}} | Effects]};
         _ ->
             {candidate, State0#{votes => NewVotes}, []}
     end;
@@ -1591,10 +1603,10 @@ initialise_peers(State = #{log := Log, cluster := Cluster0}) ->
                           end, Cluster0, PeerIds),
     State#{cluster => Cluster}.
 
-apply_to(ApplyTo, #{machine := Machine} = State, Effs) ->
+apply_to(ApplyTo, #{effective_machine_version := {_, MachineMod}} = State, Effs) ->
     apply_to(ApplyTo,
              fun(E, S) ->
-                     apply_with(Machine, E, S)
+                     apply_with(MachineMod, E, S)
              end, State, Effs).
 
 apply_to(ApplyTo, ApplyFun, State, Effs) ->
@@ -1602,6 +1614,9 @@ apply_to(ApplyTo, ApplyFun, State, Effs) ->
 
 apply_to(ApplyTo, ApplyFun, NumApplied, Notifys0, Effects0,
          #{last_applied := LastApplied,
+           %% also local_machine_version >= current_machine_version
+           %% machine_state could become {module(), MacState} to capture the
+           %% current active module
            machine_state := MacState0} = State0)
   when ApplyTo > LastApplied ->
     From = LastApplied + 1,
@@ -1618,7 +1633,7 @@ apply_to(ApplyTo, ApplyFun, NumApplied, Notifys0, Effects0,
                 lists:foldl(ApplyFun, {LastApplied, State1, MacState0,
                                        Effects0, Notifys0}, Entries),
             % {AppliedTo,_, _} = lists:last(Entries),
-            % ?INFO("applied: ~p ~nAfter: ~p", [Entries, MacState]),
+            ct:pal("applied: ~p ~nAfter: ~p", [Entries, MacState]),
             apply_to(ApplyTo, ApplyFun, NumApplied + length(Entries),
                      Notifys, Effects, State#{last_applied => AppliedTo,
                                               machine_state => MacState})
@@ -1634,14 +1649,17 @@ make_notify_effects(Nots, Prior) ->
                       [{notify, Pid, lists:reverse(Corrs)} | Acc]
               end, Prior, Nots).
 
-apply_with(Machine,
+apply_with(Module,
            {Idx, Term, {'$usr', #{ts := Ts} = CmdMeta, Cmd, ReplyType}},
-           {_, State, MacSt, Effects, Notifys0}) ->
+           {_,
+            State = #{effective_machine_version := MacVer},
+            MacSt, Effects, Notifys0}) ->
     %% augment the meta data structure with index and term
     Meta = #{index => Idx,
+             machine_version => MacVer,
              term => Term,
              system_time => Ts},
-    case ra_machine:apply(Machine, Meta, Cmd, MacSt) of
+    case ra_machine:apply(Module, Meta, Cmd, MacSt) of
         {NextMacSt, Reply, AppEffs} ->
             {ReplyEffs, Notifys} = add_reply(CmdMeta, Reply, ReplyType,
                                              Effects, Notifys0),
@@ -1651,7 +1669,7 @@ apply_with(Machine,
                                              Effects, Notifys0),
             {Idx, State, NextMacSt, ReplyEffs, Notifys}
     end;
-apply_with({machine, MacMod, _}, % Machine
+apply_with(MacMod,
            {Idx, _, {'$ra_query', CmdMeta, QueryFun, ReplyType}},
            {_, State, MacSt, Effects0, Notifys0}) ->
     %% TODO: are all queries calls?
@@ -1659,7 +1677,7 @@ apply_with({machine, MacMod, _}, % Machine
     {Effects, Notifys} = add_reply(CmdMeta, Result, ReplyType,
                                    Effects0, Notifys0),
     {Idx, State, MacSt, Effects, Notifys};
-apply_with(_Machine,
+apply_with(_,
            {Idx, Term, {'$ra_cluster_change', CmdMeta, NewCluster, ReplyType}},
            {_, State0, MacSt, Effects0, Notifys0}) ->
     {Effects, Notifys} = add_reply(CmdMeta, ok, ReplyType,
@@ -1683,17 +1701,35 @@ apply_with(_Machine,
     % add pending cluster change as next event
     {Effects1, State1} = add_next_cluster_change(Effects, State),
     {Idx, State1, MacSt, Effects1, Notifys};
-apply_with(_, % Machine
-           {Idx, Term, noop}, % Idx
-           {_, State0 = #{current_term := Term,
-                          log_id := LogId}, MacSt, Effects, Notifys}) ->
-    ?DEBUG("~s: enabling ra cluster changes in ~b~n", [LogId, Term]),
-    State = State0#{cluster_change_permitted => true},
-    {Idx, State, MacSt, Effects, Notifys};
-apply_with(_, {Idx, _, noop},
-           {_, State, MacSt, Effects, Notifys}) ->
-    %% don't log these as unhandled
-    {Idx, State, MacSt, Effects, Notifys};
+apply_with(_,
+           {Idx, Term, {noop, MacVer}},
+           {LastAppliedIdx,
+            State0 = #{current_term := CurrentTerm,
+                       machine := Machine,
+                       cluster_change_permitted := ClusterChangePerm0,
+                       effective_machine_version := OldMacVer,
+                       log_id := LogId}, MacSt, Effects, Notifys}) ->
+    %% discover the next module to use
+    Module = ra_machine:which_module(Machine, MacVer),
+    %% enable cluster change if the noop command is for the current term
+    ClusterChangePerm = case CurrentTerm of
+                            Term ->
+                                ?DEBUG("~s: enabling ra cluster changes in"
+                                       " ~b~n", [LogId, Term]),
+                                true;
+                            _ -> ClusterChangePerm0
+                        end,
+    State = State0#{cluster_change_permitted => ClusterChangePerm,
+                    effective_machine_version => MacVer,
+                    effective_machine_module => Module},
+    CmdMeta = #{index => Idx,
+                %% TODO: timestamp needs to be added at command time
+                ts => undefined,
+                term => Term},
+    apply_with(Module, {Idx, Term,
+                         {'$usr', CmdMeta,
+                          {machine_version, OldMacVer, MacVer}, none}},
+               {LastAppliedIdx, State, MacSt, Effects, Notifys});
 apply_with(Machine,
            {Idx, _, {'$ra_cluster', CmdMeta, delete, ReplyType}},
            {_, State0, MacSt, Effects0, Notifys0}) ->

@@ -196,7 +196,7 @@ flush(_Idx, Log) -> Log.
                        State :: ra_log_memory_state()) ->
     {ra_log_memory_state(), term(), list()}.
 install_snapshot(Meta, Data, #state{entries = Log0} = State) ->
-    Index  = element(1, Meta),
+    Index  = maps:get(index, Meta),
     % discard log
     Log = maps:filter(fun (K, _) -> K > Index end, Log0),
     {State#state{entries = Log, snapshot = {Meta, Data}}, Data, []}.
