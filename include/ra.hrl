@@ -116,14 +116,21 @@
          token :: reference(),
          vote_granted :: boolean()}).
 
+-type snapshot_meta() :: #{index := ra_index(),
+                           term := ra_term(),
+                           cluster := ra_cluster_servers(),
+                           version := ra_machine:version()}.
+
 -record(install_snapshot_rpc,
         {term :: ra_term(), % the leader's term
          leader_id :: ra_server_id(),
-         % the snapshot replaces all previous entries incl this
-         last_index :: ra_index(),
-         % the term at the point of snapshot
-         last_term :: ra_term(),
-         last_config :: ra_cluster_servers(),
+         meta :: snapshot_meta(),
+         % % the snapshot replaces all previous entries incl this
+         % last_index :: ra_index(),
+         % % the term at the point of snapshot
+         % last_term :: ra_term(),
+         % machine_version :: non_neg_integer(),
+         % last_config :: ra_cluster_servers(),
          chunk_state :: {pos_integer(), chunk_flag()} | undefined,
          data :: term()
         }).

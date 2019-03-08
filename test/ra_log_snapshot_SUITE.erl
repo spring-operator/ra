@@ -134,4 +134,4 @@ meta(Idx, Term, Cluster) ->
     #{index => Idx,
       term => Term,
       cluster => Cluster,
-      version => {1, dummy}}.
+      version => 1}.

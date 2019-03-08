@@ -20,10 +20,11 @@ all() ->
 
 all_tests() ->
     [
-     server_with_higher_version_needs_quorum_to_be_elected,
-     server_upgrades_machine_state_on_noop_command,
-     lower_version_does_not_apply_until_upgraded,
-     snapshot_persists_machine_version
+     % server_with_higher_version_needs_quorum_to_be_elected,
+     % unversioned_machine_never_sees_machine_version_command,
+     server_upgrades_machine_state_on_noop_command
+     % lower_version_does_not_apply_until_upgraded,
+     % snapshot_persists_machine_version
     ].
 
 
@@ -80,27 +81,41 @@ end_per_testcase(_TestCase, _Config) ->
 server_with_higher_version_needs_quorum_to_be_elected(_Config) ->
     error({todo, ?FUNCTION_NAME}).
 
+unversioned_machine_never_sees_machine_version_command(_Config) ->
+    error({todo, ?FUNCTION_NAME}).
+
 server_upgrades_machine_state_on_noop_command(Config) ->
     Mod = ?config(modname, Config),
     meck:new(Mod, [non_strict]),
     meck:expect(Mod, init, fun (_) -> init_state end),
-    meck:expect(Mod, version, fun () -> {1, Mod} end),
-    meck:expect(Mod, apply, fun (_, {machine_version, 1}, init_state) ->
+    meck:expect(Mod, version, fun () -> 1 end),
+    meck:expect(Mod, which_module, fun (_) -> Mod end),
+    meck:expect(Mod, apply, fun (_, dummy, S) ->
+                                    {S, ok};
+                                (_, {machine_version, 0, 1}, init_state) ->
                                     {state_v1, ok};
-                                (_, {machine_version, 2}, state_v1) ->
+                                (_, {machine_version, 1, 2}, state_v1) ->
                                     {state_v2, ok}
                             end),
     ClusterName = ?config(cluster_name, Config),
     ServerId = ?config(server_id, Config),
     ok = start_cluster(ClusterName, {module, Mod, #{}}, [ServerId]),
+    % need to execute a command here to ensure the noop command has been fully
+    % applied. The wal fsync could take a few ms causing the race
+    {ok, ok, _} = ra:process_command(ServerId, dummy),
     %% assert state_v1
-    {ok, {_, state_v1}, _} = ra:local_query(ServerId, fun ra_lib:id/1),
+    {ok, {_, state_v1}, _} = ra:leader_query(ServerId,
+                                             fun (S) ->
+                                                    ct:pal("leader_query ~w", [S]),
+                                                   S
+                                             end),
     ok = ra:stop_server(ServerId),
     %% increment version
-    meck:expect(Mod, version, fun () -> {2, Mod} end),
+    meck:expect(Mod, version, fun () -> 2 end),
     ok = ra:restart_server(ServerId),
-    {ok, {_, state_v2}, _} = ra:local_query(ServerId, fun ra_lib:id/1),
-    % {ok, ok, _} = ra:process_command(ServerId, {echo, self(), ?FUNCTION_NAME}),
+    {ok, ok, _} = ra:process_command(ServerId, dummy),
+
+    {ok, {_, state_v2}, _} = ra:leader_query(ServerId, fun ra_lib:id/1),
     ok.
 
 lower_version_does_not_apply_until_upgraded(_Config) ->
@@ -136,6 +151,7 @@ validate_state_enters(States) ->
 
 start_cluster(ClusterName, Machine, ServerIds) ->
     {ok, Started, _} = ra:start_cluster(ClusterName, Machine, ServerIds),
+    _ = ra:members(hd(Started)),
     ?assertEqual(length(ServerIds), length(Started)),
     ok.
 

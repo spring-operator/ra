@@ -51,7 +51,8 @@ all() ->
      follower_aer_4,
      follower_aer_5,
      follower_catchup_condition,
-     wal_down_condition
+     wal_down_condition,
+     update_release_cursor
     ].
 
 -define(MACFUN, fun (E, _) -> E end).
@@ -136,6 +137,8 @@ setup_log() ->
                             {_, Log} -> {false, Log}
                         end
                 end),
+    meck:expect(ra_log, update_release_cursor,
+                fun ra_log_memory:update_release_cursor/5),
     ok.
 
 init_test(_Config) ->
@@ -161,8 +164,9 @@ init_test(_Config) ->
     #{current_term := 5,
       voted_for := some_server} = ra_server_init(InitConf),
     % snapshot
-    SnapshotMeta = #{index => 3, term => 5, cluster => maps:keys(Cluster),
-                     version => {1, ?FUNCTION_NAME}},
+    SnapshotMeta = #{index => 3, term => 5,
+                     cluster => maps:keys(Cluster),
+                     version => 1},
     SnapshotData = "hi1+2+3",
     {LogS, _, _} = ra_log_memory:install_snapshot(SnapshotMeta, SnapshotData,
                                                   Log0),
@@ -190,7 +194,7 @@ recover_restores_cluster_changes(_Config) ->
                                                            current_term => 1,
                                                            voted_for => n1}),
     {leader, State0 = #{cluster := Cluster0}, _} =
-        ra_server:handle_leader({command, {noop, {1, ?MODULE}}}, State00),
+        ra_server:handle_leader({command, {noop, 0}}, State00),
     {leader, State, _} = ra_server:handle_leader(written_evt({1, 1, 1}), State0),
     ?assert(maps:size(Cluster0) =:= 1),
 
@@ -624,8 +628,11 @@ follower_catchup_condition(_Config) ->
 
     ISRpc = #install_snapshot_rpc{term = 99, leader_id = n1,
                                   chunk_state = {1, last},
-                                  last_index = 99, last_term = 99,
-                                  last_config = [], data = []},
+                                  meta = #{index => 99,
+                                           term => 99,
+                                           cluster => [],
+                                           version => 0},
+                                  data = []},
     {follower, State, [_NextEvent]} =
         ra_server:handle_await_condition(ISRpc, State),
 
@@ -667,6 +674,18 @@ wal_down_condition(_Config) ->
     % exit condition
     {follower, _State, [_]}
     = ra_server:handle_await_condition(EmptyAE#append_entries_rpc{entries = [{4, 5, yo}]}, State),
+    ok.
+
+update_release_cursor(_Config) ->
+    State00 = (base_state(3, ?FUNCTION_NAME)),
+    %% unversioned should error if machine version is higher than 0, i.e. it
+    %% provides a version but the state machine isn't versioned
+    ?assertExit({invalid_state_machine_version, 1},
+        ra_server:update_release_cursor(2, 1, some_state, State00)),
+
+    meck:expect(?FUNCTION_NAME, version, fun () -> 1 end),
+    ?assertMatch({_, _},
+                 ra_server:update_release_cursor(2, 1, some_state, State00)),
     ok.
 
 candidate_handles_append_entries_rpc(_Config) ->
@@ -973,7 +992,7 @@ consistent_query(_Config) ->
 leader_noop_operation_enables_cluster_change(_Config) ->
     State00 = (base_state(3, ?FUNCTION_NAME))#{cluster_change_permitted => false},
     {leader, #{cluster_change_permitted := false} = State0, _Effects} =
-        ra_server:handle_leader({command, {noop, {1, ?MODULE}}}, State00),
+        ra_server:handle_leader({command, {noop, 1}}, State00),
     {leader, State, _} = ra_server:handle_leader({ra_log_event, {written, {4, 4, 5}}}, State0),
     AEReply = {n2, #append_entries_reply{term = 5, success = true,
                                          next_index = 5,
@@ -985,14 +1004,20 @@ leader_noop_operation_enables_cluster_change(_Config) ->
 
 leader_noop_increments_machine_version(_Config) ->
     Mod = ?FUNCTION_NAME,
-    OldMacVer = {1, Mod},
+    OldMacVer = 1,
     State00 = (base_state(3, ?FUNCTION_NAME))#{cluster_change_permitted => false,
                                                effective_machine_version => OldMacVer},
     ModV2 = leader_noop_increments_machine_version_v2,
     meck:new(ModV2, [non_strict]),
-    MacVer = {2, ModV2},
-    {leader, #{effective_machine_version := OldMacVer} = State0, _Effects} =
-        ra_server:handle_leader({command, {noop, MacVer}}, State00),
+    MacVer = 2,
+    meck:expect(Mod, version, fun () -> MacVer end),
+    meck:expect(Mod, which_module, fun (1) -> Mod;
+                                       (2) -> ModV2
+                                   end),
+    {leader, #{effective_machine_version := OldMacVer,
+               effective_machine_module := Mod} = State0, _Effects} =
+        ra_server:handle_leader({command, {noop, MacVer}},
+                                 State00),
     %% new machine version is applied
     {leader, State1, _} =
         ra_server:handle_leader({ra_log_event, {written, {4, 4, 5}}}, State0),
@@ -1009,7 +1034,8 @@ leader_noop_increments_machine_version(_Config) ->
                                          next_index = 5,
                                          last_index = 4, last_term = 5}},
     % noop consensus
-    {leader, #{effective_machine_version := MacVer}, _} =
+    {leader, #{effective_machine_version := MacVer,
+               effective_machine_module := ModV2}, _} =
         ra_server:handle_leader(AEReply, State1),
 
     ?assert(meck:called(ModV2, apply, ['_', {machine_version, 1, 2}, '_'])),
@@ -1203,7 +1229,7 @@ leader_appends_cluster_change_then_steps_before_applying_it(_Config) ->
     % leader has committed the entry but n2 and n3 have not yet seen it and
     % n2 has been elected leader and is replicating a different entry for
     % index 4 with a higher term
-    AE = #append_entries_rpc{entries = [{4, 6, {noop, {1, ?MODULE}}}],
+    AE = #append_entries_rpc{entries = [{4, 6, {noop, 1}}],
                              leader_id = n2,
                              term = 6,
                              prev_log_index = 3,
@@ -1264,9 +1290,8 @@ candidate_election(_Config) ->
     {follower, #{current_term := 7}, []}
         = ra_server:handle_candidate(HighTermResult, State1),
 
-    MacVer = {1, ?FUNCTION_NAME},
-    meck:expect(ra_machine, latest_version,
-                fun (_) -> MacVer end),
+    MacVer = 1,
+    meck:expect(ra_machine, version, fun (_) -> MacVer end),
 
     % quorum has been achieved - candidate becomes leader
     PeerState = new_peer_with(#{next_index => 3+1, % leaders last log index + 1
@@ -1335,9 +1360,12 @@ pre_vote_election_reverts(_Config) ->
 
     % install snapshot rpc
     ISR = #install_snapshot_rpc{term = 5, leader_id = n2,
-                                last_index = 3, last_term = 5,
+                                meta = #{index => 3,
+                                         term => 5,
+                                         cluster => [],
+                                         version => 0},
                                 chunk_state = {1, last},
-                                last_config = [], data = []},
+                                data = []},
     {follower, #{current_term := 5, votes := 0}, [{next_event, ISR}]}
         = ra_server:handle_pre_vote(ISR, State),
     ok.
@@ -1368,9 +1396,12 @@ leader_receives_install_snapshot_rpc(_Config) ->
     State  = #{current_term := Term,
                last_applied := Idx} = (base_state(5, ?FUNCTION_NAME))#{votes => 1},
     ISRpc = #install_snapshot_rpc{term = Term + 1, leader_id = n5,
-                                  last_index = Idx, last_term = Term,
+                                  meta = #{index => Idx,
+                                           term => Term,
+                                           cluster => [],
+                                           version => 0},
                                   chunk_state = {1, last},
-                                  last_config = [], data = []},
+                                  data = []},
     {follower, #{}, [{next_event, ISRpc}]}
         = ra_server:handle_leader(ISRpc, State),
     % leader ignores lower term
@@ -1386,16 +1417,22 @@ follower_installs_snapshot(_Config) ->
     Term = 2, % leader term
     Idx = 3,
     ISRpc = #install_snapshot_rpc{term = Term, leader_id = n1,
-                                  last_index = Idx, last_term = LastTerm,
+                                  meta = snap_meta(Idx, LastTerm,
+                                                   maps:keys(Config)),
                                   chunk_state = {1, last},
-                                  last_config = maps:keys(Config),
                                   data = []},
     {receive_snapshot, FState1,
      [{next_event, ISRpc}]} =
         ra_server:handle_follower(ISRpc, FState),
 
     meck:expect(ra_log, recover_snapshot,
-                fun (_) -> {{Idx, Term, maps:keys(Config)}, []} end),
+                fun (_) ->
+                        {#{index => Idx,
+                           term => Term,
+                           cluster => maps:keys(Config),
+                           version => 0},
+                         []}
+                end),
 
     {follower, #{current_term := Term,
                  commit_index := Idx,
@@ -1416,9 +1453,9 @@ follower_receives_stale_snapshot(_Config) ->
     LastTerm = 1, % snapshot term
     Idx = 2,
     ISRpc = #install_snapshot_rpc{term = CurTerm, leader_id = n1,
-                                  last_index = Idx, last_term = LastTerm,
+                                  meta = snap_meta(Idx, LastTerm,
+                                                   maps:keys(Config)),
                                   chunk_state = {1, last},
-                                  last_config = maps:keys(Config),
                                   data = []},
     %% this should be a rare occurence, rather than implement a special
     %% protocol at this point the server just replies
@@ -1434,9 +1471,9 @@ receive_snapshot_timeout(_Config) ->
     LastTerm = 1, % snapshot term
     Idx = 6,
     ISRpc = #install_snapshot_rpc{term = CurTerm, leader_id = n1,
-                                  last_index = Idx, last_term = LastTerm,
+                                  meta = snap_meta(Idx, LastTerm,
+                                                   maps:keys(Config)),
                                   chunk_state = {1, last},
-                                  last_config = maps:keys(Config),
                                   data = []},
     {receive_snapshot, FState1,
      [{next_event, ISRpc}]} =
@@ -1457,11 +1494,18 @@ snapshotted_follower_received_append_entries(_Config) ->
     Term = 2, % leader term
     Idx = 3,
     meck:expect(ra_log, recover_snapshot,
-                fun (_) -> {{Idx, Term, maps:keys(Config)}, []} end),
+                fun (_) ->
+                        {#{index => Idx, 
+                           term => Term, 
+                           cluster => maps:keys(Config),
+                           version => 0},
+                         []}
+                end),
     ISRpc = #install_snapshot_rpc{term = Term, leader_id = n1,
-                                  last_index = Idx, last_term = LastTerm,
+                                  meta = snap_meta(Idx, LastTerm,
+                                                   maps:keys(Config)),
                                   chunk_state = {1, last},
-                                  last_config = maps:keys(Config), data = []},
+                                  data = []},
     {follower, FState1, _} = ra_server:handle_receive_snapshot(ISRpc, FState0),
 
     meck:expect(ra_log, snapshot_index_term,
@@ -1492,7 +1536,7 @@ leader_received_append_entries_reply_with_stale_last_index(_Config) ->
     Log = lists:foldl(fun(E, L) ->
                               ra_log:append_sync(E, L)
                       end, ra_log:init(#{data_dir => "", uid => <<>>}),
-                      [{1, 1, {noop, {1, ?MODULE}}},
+                      [{1, 1, {noop, 1}},
                        {2, 2, {'$usr', meta(), {enq, apple}, after_log_append}},
                        {3, 5, {2, {'$usr', meta(), {enq, pear}, after_log_append}}}]),
     Leader0 = #{cluster =>
@@ -1514,6 +1558,9 @@ leader_received_append_entries_reply_with_stale_last_index(_Config) ->
                 machine => {machine, ra_machine_simple,
                             #{simple_fun => ?MACFUN,
                               initial_state => <<>>}},
+                machine_version => 0,
+                effective_machine_version => 0,
+                effective_machine_module =>  ra_machine_simple,
                 machine_state => [{4,apple}],
                 pending_cluster_changes => []},
     AER = #append_entries_reply{success = false,
@@ -1530,7 +1577,7 @@ leader_received_append_entries_reply_with_stale_last_index(_Config) ->
 
 
 leader_receives_install_snapshot_result(_Config) ->
-    MacVer = {1, ?MODULE},
+    MacVer = {0, 1, ?MODULE},
     % should update peer next_index
     Term = 1,
     Log0 = lists:foldl(fun(E, L) ->
@@ -1557,6 +1604,9 @@ leader_receives_install_snapshot_result(_Config) ->
                log => Log0,
                machine => {machine, ?FUNCTION_NAME, #{}},
                machine_state => [{4,apple}],
+               machine_version => 0,
+               effective_machine_version => 1,
+               effective_machine_module => ra_machine_simple,
                pending_cluster_changes => []},
     ISR = #install_snapshot_result{term = Term,
                                    last_index = 2,
@@ -1631,6 +1681,9 @@ base_state(NumServers, MacMod) ->
       last_applied => 3,
       machine => {machine, MacMod, #{}}, % just keep last applied value
       machine_state => <<"hi3">>, % last entry has been applied
+      machine_version => 0,
+      effective_machine_version => 0,
+      effective_machine_module => MacMod,
       log => Log}.
 
 mock_machine(Mod) ->
@@ -1663,3 +1716,13 @@ new_peer() ->
 
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
+
+snap_meta(Idx, Term) ->
+    snap_meta(Idx, Term, []).
+
+snap_meta(Idx, Term, Cluster) ->
+    #{index => Idx,
+      term => Term,
+      cluster => Cluster,
+      version => 0}.
+

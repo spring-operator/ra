@@ -3,10 +3,9 @@
 -include("ra.hrl").
 
 -type file_err() :: file:posix() | badarg | terminated | system_limit.
--type meta() :: #{index := ra_index(),
-                  term := ra_term(),
-                  cluster := ra_cluster_servers(),
-                  version := ra_machine:version()}.
+
+%% alias
+-type meta() :: snapshot_meta().
 
 -export([
          recover/1,

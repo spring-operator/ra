@@ -843,7 +843,8 @@ handle_await_condition(Msg, #state{server_state = ServerState0} = State) ->
         ra_server:handle_await_condition(Msg, ServerState0),
     {NextState, State#state{server_state = ServerState}, Effects}.
 
-perform_local_query(QueryFun, Leader, #{machine := {machine, MacMod, _},
+%% TODO: move to ra_server
+perform_local_query(QueryFun, Leader, #{effective_machine_module := MacMod,
                                         machine_state := MacState,
                                         last_applied := Last,
                                         current_term := Term}) ->
@@ -964,8 +965,13 @@ handle_effect(_, {send_vote_requests, VoteRequests}, _, % EvtType
      end || {N, M} <- VoteRequests],
     {State, Actions};
 handle_effect(RaftState, {release_cursor, Index, MacState}, EvtType,
+              State0, Actions0) ->
+    handle_effect(RaftState, {release_cursor, Index, MacState, 0}, EvtType,
+                  State0, Actions0);
+handle_effect(RaftState, {release_cursor, Index, MacState, MacVersion}, EvtType,
               #state{server_state = ServerState0} = State0, Actions0) ->
-    {ServerState, Effects} = ra_server:update_release_cursor(Index, MacState,
+    {ServerState, Effects} = ra_server:update_release_cursor(Index, MacVersion,
+                                                             MacState,
                                                              ServerState0),
     State1 = State0#state{server_state = ServerState},
     {State, Actions} = handle_effects(RaftState, Effects, EvtType, State1),
@@ -1256,32 +1262,28 @@ receive_snapshot_timeout() ->
 
 send_snapshots(Me, Id, Term, To, ChunkSize, SnapState) ->
     {ok,
-     {LastIdx, LastTerm, Config},
+     Meta,
      ReadState} = ra_snapshot:begin_read(SnapState),
 
     RPC = #install_snapshot_rpc{term = Term,
                                 leader_id = Id,
-                                last_index = LastIdx,
-                                last_term = LastTerm,
-                                last_config = Config},
+                                meta = Meta},
 
     Result = read_chunks_and_send_rpc(RPC, To, ReadState, 1,
                                       ChunkSize, SnapState),
     ok = gen_statem:cast(Me, {To, Result}).
 
-read_chunks_and_send_rpc(RPC0, To, ReadState0, Num, ChunkSize, SnapState) ->
-    Conf = case Num of
-               1 -> RPC0#install_snapshot_rpc.last_config;
-               _ -> undefined
-           end,
+read_chunks_and_send_rpc(RPC0,
+                         To, ReadState0, Num, ChunkSize, SnapState) ->
     {ok, Data, ContState} = ra_snapshot:read_chunk(ReadState0, ChunkSize,
                                                    SnapState),
     ChunkFlag = case ContState of
                     {next, _} -> next;
                     last -> last
                 end,
-    RPC1 = RPC0#install_snapshot_rpc{last_config = Conf,
-                                     chunk_state = {Num, ChunkFlag},
+    %% TODO: some of the metadata, e.g. the cluster is redundant in subsequent
+    %% rpcs
+    RPC1 = RPC0#install_snapshot_rpc{chunk_state = {Num, ChunkFlag},
                                      data = Data},
     Res1 = gen_statem:call(To, RPC1,
                            {dirty_timeout, ?INSTALL_SNAP_RPC_TIMEOUT}),

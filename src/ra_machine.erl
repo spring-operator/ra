@@ -73,7 +73,8 @@
          handle_aux/7,
          snapshot_module/1,
          version/1,
-         which_module/2
+         which_module/2,
+         is_versioned/1
         ]).
 
 -type state() :: term().
@@ -171,7 +172,8 @@
 
 -type command_meta_data() :: #{system_time := integer(),
                                index := ra_index(),
-                               term := ra_term()}.
+                               term := ra_term(),
+                               machine_version => version()}.
 %% extensible command meta data map
 
 
@@ -266,6 +268,10 @@ overview(Mod, State) ->
 -spec version(machine()) -> version().
 version({machine, Mod, _}) ->
     ?OPT_CALL(assert_integer(Mod:version()), ?DEFAULT_VERSION).
+
+-spec is_versioned(machine()) -> boolean().
+is_versioned(Machine) ->
+    version(Machine) /= ?DEFAULT_VERSION.
 
 -spec which_module(machine(), version()) -> module().
 which_module({machine, Mod, _}, Version) ->

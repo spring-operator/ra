@@ -17,7 +17,7 @@
          read_snapshot/1,
          recover_snapshot/1,
          snapshot_index_term/1,
-         update_release_cursor/4,
+         update_release_cursor/5,
          read_meta/2,
          write_meta/3,
          write_meta_f/3,
@@ -33,7 +33,7 @@
 -include("ra.hrl").
 
 -type ra_log_memory_meta() :: #{atom() => term()}.
--type snapshot() :: {{ra_index(), ra_term(), ra_cluster_servers()}, term()}.
+-type snapshot() :: {snapshot_meta(), term()}.
 
 -record(state, {last_index = 0 :: ra_index(),
                 last_written = {0, 0} :: ra_idxterm(), % only here to fake the async api of the file based one
@@ -85,8 +85,8 @@ write([{FirstIdx, _, _} | _] = Entries,
     {ok, State#state{last_index = LastInIdx,
                           entries = Log}};
 write([{FirstIdx, _, _} | _] = Entries,
-      #state{snapshot = {Meta, _}, entries = Log0} = State)
- when element(1, Meta) + 1 =:= FirstIdx ->
+      #state{snapshot = {#{index := SnapIdx}, _}, entries = Log0} = State)
+ when SnapIdx + 1 =:= FirstIdx ->
     {Log, LastInIdx} = lists:foldl(fun ({Idx, Term, Data}, {Acc, _}) ->
                                            {Acc#{Idx => {Term, Data}}, Idx}
                                    end, {Log0, FirstIdx}, Entries),
@@ -125,7 +125,7 @@ last_index_term(#state{last_index = LastIdx,
         _ ->
             % If not found fall back on snapshot if snapshot matches last term.
             case Snapshot of
-                {{LastIdx, LastTerm, _}, _} ->
+                {#{index := LastIdx, term := LastTerm}, _} ->
                     {LastIdx, LastTerm};
                 _ ->
                     undefined
@@ -221,16 +221,17 @@ read_meta(Key, #state{meta = Meta}) ->
 
 -spec snapshot_index_term(State :: ra_log_memory_state()) ->
     ra_idxterm().
-snapshot_index_term(#state{snapshot = {{Idx, Term, _}, _}}) ->
+snapshot_index_term(#state{snapshot = {#{index := Idx, term := Term}, _}}) ->
     {Idx, Term};
 snapshot_index_term(#state{snapshot = undefined}) ->
     undefined.
 
--spec update_release_cursor(ra_index(), ra_cluster(), term(),
+-spec update_release_cursor(ra_index(), ra_cluster(),
+                            ra_machine:version(), term(),
                             ra_log_memory_state()) ->
     ra_log_memory_state().
-update_release_cursor(_Idx, _Cluster, _MacState, State) ->
-    State.
+update_release_cursor(_Idx, _Cluster, _, _MacState, State) ->
+    {State, []}.
 
 write_meta(_Key, _Value, _State) ->
     ok.
